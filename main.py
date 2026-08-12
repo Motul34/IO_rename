@@ -1,23 +1,25 @@
 import sys
 import re
 import os
+import glob
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, 
                              QVBoxLayout, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMenuBar, QFileDialog, QMessageBox, 
-                             QStyledItemDelegate, QLineEdit, QAbstractItemView)
+                             QStyledItemDelegate, QLineEdit, QAbstractItemView,
+                             QTreeWidget, QTreeWidgetItem, QInputDialog, QSplitter)
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt, pyqtSignal
+
 from io_manager import IOManager
+from urp_manager import URPManager
 
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# 15文字制限用のデリゲート
 class MaxLengthDelegate(QStyledItemDelegate):
     def __init__(self, max_length, parent=None):
         super().__init__(parent)
@@ -31,13 +33,21 @@ class MaxLengthDelegate(QStyledItemDelegate):
 class IOEditorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("UR .installation IO Editor")
+        self.setWindowTitle("UR IO & Node Editor")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.resize(1000, 700)
+        self.resize(1200, 700)
         self.io_manager = IOManager()
-        self.current_file = None
+        self.urp_manager = URPManager()
         
-        # モダン・ライトのスタイル適用
+        self.current_installation_file = None
+        self.current_urp_file = None
+        
+        # UIステート管理用
+        self.io_tabs_indices = []
+        self.urp_tabs_indices = []
+        self.urp_elements_map = {} # { element_id : (tab_index, row) }
+        self.tree_item_map = {} # { element_id : QTreeWidgetItem }
+
         self.setStyleSheet("""
             QMainWindow { background-color: #f0f0f0; }
             QTableWidget { gridline-color: #d0d0d0; alternate-background-color: #e8f4f8; }
@@ -45,6 +55,7 @@ class IOEditorWindow(QMainWindow):
             QTabWidget::pane { border: 1px solid #cccccc; }
             QTabBar::tab { background: #e0e0e0; padding: 8px 16px; margin-right: 2px; }
             QTabBar::tab:selected { background: #ffffff; border-top: 2px solid #0078d7; font-weight: bold; }
+            QTreeWidget { background-color: #ffffff; border: 1px solid #cccccc; }
         """)
         
         self.init_menu()
@@ -54,15 +65,18 @@ class IOEditorWindow(QMainWindow):
         menubar = self.menuBar()
         fileMenu = menubar.addMenu("ファイル(F)")
         
-        open_action = fileMenu.addAction("開く(O)...")
-        open_action.triggered.connect(self.open_file)
+        open_file_action = fileMenu.addAction("ファイルを開く(O)...")
+        open_file_action.triggered.connect(self.open_file_dialog)
+        
+        open_dir_action = fileMenu.addAction("フォルダを開く(D)...")
+        open_dir_action.triggered.connect(self.open_dir_dialog)
         
         self.save_action = fileMenu.addAction("上書き保存(S)")
-        self.save_action.triggered.connect(self.save_file)
+        self.save_action.triggered.connect(self.save_files)
         self.save_action.setEnabled(False)
         
         save_as_action = fileMenu.addAction("名前を付けて保存(A)...")
-        save_as_action.triggered.connect(self.save_as_file)
+        save_as_action.triggered.connect(self.save_as_files)
         
         fileMenu.addSeparator()
         exit_action = fileMenu.addAction("終了(X)")
@@ -76,50 +90,76 @@ class IOEditorWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.layout.addWidget(self.tabs)
         
-        # タブ構成の定義
-        # (タブ名, 項目リスト: (XMLタグ名, 表示用Type名, is_gp))
-        self.tab_configs = [
-            ("Digital", [
-                ('DigitalInputNames', 'Digital Input', False),
-                ('DigitalOutputNames', 'Digital Output', False)
-            ]),
-            ("Tool", [
-                ('ToolDigitalInputNames', 'Tool Digital Input', False),
-                ('ToolDigitalOutputNames', 'Tool Digital Output', False),
-                ('ToolAnalogInputNames', 'Tool Analog Input', False)
-            ]),
-            ("Analog", [
-                ('AnalogInputNames', 'Analog Input', False),
-                ('AnalogOutputNames', 'Analog Output', False)
-            ]),
-            ("GP Boolean", [
-                ('GeneralPurposeBooleanRegisterInputNames', 'GP Boolean Input', True),
-                ('GeneralPurposeBooleanRegisterOutputNames', 'GP Boolean Output', True)
-            ]),
-            ("GP Int", [
-                ('GeneralPurposeIntRegisterInputNames', 'GP Int Input', True),
-                ('GeneralPurposeIntRegisterOutputNames', 'GP Int Output', True)
-            ]),
-            ("GP Float", [
-                ('GeneralPurposeFloatRegisterInputNames', 'GP Float Input', True),
-                ('GeneralPurposeFloatRegisterOutputNames', 'GP Float Output', True)
-            ])
+        # --- プログラムツリータブ (一番左) ---
+        self.tree_tab = QWidget()
+        tree_layout = QVBoxLayout(self.tree_tab)
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderHidden(True)
+        self.tree_widget.itemClicked.connect(self.on_tree_item_clicked)
+        self.tree_widget.setStyleSheet("""
+            QTreeWidget {
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 10pt;
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+            }
+            QTreeWidget::item {
+                padding: 2px;
+            }
+        """)
+        self.tree_widget.setIndentation(20)
+        tree_layout.addWidget(self.tree_widget)
+        self.tabs.addTab(self.tree_tab, "Program Tree")
+        self.tree_tab_index = 0
+        
+        # --- URP ノード編集タブ ---
+        self.urp_tab_configs = [
+            ("Folder", "Folder"),
+            ("Assignment (代入)", "Assignment"),
+            ("Comment (コメント)", "Comment"),
+            ("Timer (タイマー)", "Timer"),
+            ("Waypoint (ウェイポイント)", "Waypoint")
         ]
+        self.urp_tables = {} # tag_name: table_widget
         
-        self.tables = {} # tag_name: table_widget
-        self.tag_is_gp = {}
-        
-        for tab_name, tags in self.tab_configs:
+        for tab_name, tag_name in self.urp_tab_configs:
             tab = QWidget()
             tab_layout = QVBoxLayout(tab)
+            table = QTableWidget(0, 2)
+            table.setHorizontalHeaderLabels(["Index", "Node Name"])
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            table.verticalHeader().setVisible(False)
+            table.setAlternatingRowColors(True)
+            table.setItemDelegateForColumn(1, MaxLengthDelegate(50, table)) # ノード名は少し長めでもOKとする
             
+            table.itemChanged.connect(lambda item, t=tag_name: self.on_urp_item_changed(item, t))
+            
+            tab_layout.addWidget(table)
+            self.urp_tables[tag_name] = table
+            idx = self.tabs.addTab(tab, tab_name)
+            self.urp_tabs_indices.append(idx)
+        
+        # --- IO 編集タブ ---
+        self.io_tab_configs = [
+            ("Digital", [('DigitalInputNames', 'Digital Input', False), ('DigitalOutputNames', 'Digital Output', False)]),
+            ("Tool", [('ToolDigitalInputNames', 'Tool Digital Input', False), ('ToolDigitalOutputNames', 'Tool Digital Output', False), ('ToolAnalogInputNames', 'Tool Analog Input', False)]),
+            ("Analog", [('AnalogInputNames', 'Analog Input', False), ('AnalogOutputNames', 'Analog Output', False)]),
+            ("GP Boolean", [('GeneralPurposeBooleanRegisterInputNames', 'GP Boolean Input', True), ('GeneralPurposeBooleanRegisterOutputNames', 'GP Boolean Output', True)]),
+            ("GP Int", [('GeneralPurposeIntRegisterInputNames', 'GP Int Input', True), ('GeneralPurposeIntRegisterOutputNames', 'GP Int Output', True)]),
+            ("GP Float", [('GeneralPurposeFloatRegisterInputNames', 'GP Float Input', True), ('GeneralPurposeFloatRegisterOutputNames', 'GP Float Output', True)])
+        ]
+        
+        self.io_tables = {}
+        self.io_tag_is_gp = {}
+        
+        for tab_name, tags in self.io_tab_configs:
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
             for tag_name, display_type, is_gp in tags:
-                self.tag_is_gp[tag_name] = is_gp
+                self.io_tag_is_gp[tag_name] = is_gp
                 table = QTableWidget(0, 4 if is_gp else 3)
-                
                 if is_gp:
                     table.setHorizontalHeaderLabels(["Index", "Type", "Addr", "IO Name"])
-                    # IO Name を一番伸ばす
                     table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
                     table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
                 else:
@@ -128,80 +168,433 @@ class IOEditorWindow(QMainWindow):
                 
                 table.verticalHeader().setVisible(False)
                 table.setAlternatingRowColors(True)
-                
-                # IO Nameの列に15文字制限デリゲートをセット
                 name_col = 3 if is_gp else 2
                 table.setItemDelegateForColumn(name_col, MaxLengthDelegate(15, table))
                 
-                # GPのAddr編集イベントを捉える
                 if is_gp:
-                    table.itemChanged.connect(lambda item, t=table: self.on_item_changed(item, t))
+                    table.itemChanged.connect(lambda item, t=table: self.on_io_item_changed(item, t))
                 
                 tab_layout.addWidget(table)
-                self.tables[tag_name] = table
-                
-            self.tabs.addTab(tab, tab_name)
+                self.io_tables[tag_name] = table
+            idx = self.tabs.addTab(tab, tab_name)
+            self.io_tabs_indices.append(idx)
+            
+        self.set_io_tabs_enabled(False)
+        self.set_urp_tabs_enabled(False)
 
-    def open_file(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "開く", "", "Installation Files (*.installation);;All Files (*)")
+    def set_io_tabs_enabled(self, enabled):
+        for idx in self.io_tabs_indices:
+            self.tabs.setTabEnabled(idx, enabled)
+
+    def set_urp_tabs_enabled(self, enabled):
+        self.tabs.setTabEnabled(self.tree_tab_index, enabled)
+        for idx in self.urp_tabs_indices:
+            self.tabs.setTabEnabled(idx, enabled)
+
+    def open_file_dialog(self):
+        filepath, _ = QFileDialog.getOpenFileName(self, "ファイルを開く", "", "UR Files (*.installation *.urp);;All Files (*)")
         if filepath:
-            try:
-                self.io_manager.load(filepath)
-                self.current_file = filepath
-                self.populate_tables()
-                self.save_action.setEnabled(True)
-                self.setWindowTitle(f"UR .installation IO Editor - {os.path.basename(filepath)}")
-                QMessageBox.information(self, "成功", "ファイルを読み込みました。")
-            except Exception as e:
-                QMessageBox.critical(self, "エラー", f"読み込みエラー:\n{str(e)}")
+            self.load_files([filepath])
 
-    def populate_tables(self):
-        for tag_name, table in self.tables.items():
-            table.blockSignals(True) # 値セット中のイベント発火を防ぐ
+    def open_dir_dialog(self):
+        dirpath = QFileDialog.getExistingDirectory(self, "フォルダを開く")
+        if dirpath:
+            inst_files = glob.glob(os.path.join(dirpath, "*.installation"))
+            urp_files = glob.glob(os.path.join(dirpath, "*.urp"))
+            
+            files_to_load = []
+            
+            # .installationファイルの選択
+            if len(inst_files) == 1:
+                files_to_load.append(inst_files[0])
+            elif len(inst_files) > 1:
+                item, ok = QInputDialog.getItem(self, "選択", ".installationファイルを選択してください:", [os.path.basename(f) for f in inst_files], 0, False)
+                if ok and item:
+                    files_to_load.append(os.path.join(dirpath, item))
+                    
+            # .urpファイルの選択
+            if len(urp_files) == 1:
+                files_to_load.append(urp_files[0])
+            elif len(urp_files) > 1:
+                item, ok = QInputDialog.getItem(self, "選択", ".urpファイルを選択してください:", [os.path.basename(f) for f in urp_files], 0, False)
+                if ok and item:
+                    files_to_load.append(os.path.join(dirpath, item))
+                    
+            if not files_to_load:
+                QMessageBox.warning(self, "警告", "フォルダ内に対象ファイルが見つかりませんでした。")
+                return
+                
+            self.load_files(files_to_load)
+
+    def load_files(self, filepaths):
+        self.current_installation_file = None
+        self.current_urp_file = None
+        
+        self.io_manager.clear()
+        self.urp_manager = URPManager() # reset
+        
+        loaded_inst = False
+        loaded_urp = False
+        
+        for fp in filepaths:
+            ext = os.path.splitext(fp)[1].lower()
+            try:
+                if ext == '.installation':
+                    self.io_manager.load(fp)
+                    self.current_installation_file = fp
+                    loaded_inst = True
+                elif ext == '.urp':
+                    self.urp_manager.load(fp)
+                    self.current_urp_file = fp
+                    loaded_urp = True
+            except Exception as e:
+                QMessageBox.critical(self, "エラー", f"{os.path.basename(fp)} の読み込みエラー:\n{str(e)}")
+        
+        self.set_io_tabs_enabled(loaded_inst)
+        self.set_urp_tabs_enabled(loaded_urp)
+        
+        if loaded_inst:
+            self.populate_io_tables()
+        if loaded_urp:
+            self.populate_urp_data()
+            
+        self.save_action.setEnabled(loaded_inst or loaded_urp)
+        
+        title = "UR IO & Node Editor"
+        if loaded_inst and loaded_urp:
+            title += f" - {os.path.basename(self.current_installation_file)}, {os.path.basename(self.current_urp_file)}"
+        elif loaded_inst:
+            title += f" - {os.path.basename(self.current_installation_file)}"
+        elif loaded_urp:
+            title += f" - {os.path.basename(self.current_urp_file)}"
+        self.setWindowTitle(title)
+        
+        QMessageBox.information(self, "成功", "読み込みが完了しました。")
+
+    # --- URP 関連処理 ---
+    def populate_urp_data(self):
+        self.tree_widget.clear()
+        self.urp_elements_map.clear()
+        self.tree_item_map.clear()
+        
+        # ツリーの構築
+        root_elem = self.urp_manager.get_root_node()
+        if root_elem is not None:
+            self.build_tree(root_elem, self.tree_widget.invisibleRootItem())
+            self.tree_widget.expandAll()
+            
+            def collapse_hidden(item):
+                if "(非表示)" in item.text(0):
+                    item.setExpanded(False)
+                for i in range(item.childCount()):
+                    collapse_hidden(item.child(i))
+                    
+            root_item = self.tree_widget.invisibleRootItem()
+            for i in range(root_item.childCount()):
+                collapse_hidden(root_item.child(i))
+            
+        # 編集テーブルの構築
+        for tab_name, tag_name in self.urp_tab_configs:
+            table = self.urp_tables[tag_name]
+            table.blockSignals(True)
+            nodes = self.urp_manager.get_editable_nodes(tag_name)
+            table.setRowCount(len(nodes))
+            
+            # タブのインデックスを特定
+            tab_index = -1
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i) == tab_name:
+                    tab_index = i
+                    break
+                    
+            for row, elem in enumerate(nodes):
+                elem_id = id(elem)
+                self.urp_elements_map[elem_id] = (tab_index, row, tag_name)
+                
+                # Index
+                item_idx = QTableWidgetItem(str(row))
+                item_idx.setFlags(item_idx.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(row, 0, item_idx)
+                
+                # Name
+                name = self.urp_manager.get_node_name(elem)
+                table.setItem(row, 1, QTableWidgetItem(name))
+                
+            table.blockSignals(False)
+
+    def parse_expression(self, expr_elem):
+        if expr_elem is None:
+            return ""
+        
+        parts = []
+        for child in expr_elem.iter():
+            if child.tag == 'ExpressionChar':
+                parts.append(child.attrib.get('character', ''))
+            elif child.tag == 'ExpressionToken':
+                parts.append(child.attrib.get('token', ''))
+            elif child.tag == 'ExpressionVariable':
+                pv = child.find('ProgramVariable')
+                if pv is not None:
+                    parts.append(self.resolve_variable_name(pv))
+                else:
+                    v = child.find('variable')
+                    if v is not None:
+                        parts.append(self.resolve_variable_name(v))
+            elif child.tag == 'ExpressionIO':
+                pin = child.find('pin')
+                if pin is not None:
+                    name = pin.attrib.get('referencedName', '')
+                    parts.append(self.resolve_io_name(name))
+            elif child.tag == 'ExpressionWaypoint':
+                wp = child.find('Waypoint')
+                if wp is not None:
+                    parts.append(self.resolve_variable_name(wp))
+        return "".join(parts)
+
+    def resolve_variable_name(self, var_elem):
+        if var_elem is None:
+            return ''
+        name = var_elem.attrib.get('name')
+        if name:
+            return name
+        ref = var_elem.attrib.get('reference')
+        if ref and hasattr(self, 'xml_parent_map'):
+            curr = var_elem
+            for part in ref.split('/'):
+                if part == '..':
+                    curr = self.xml_parent_map.get(curr)
+                elif part and curr is not None:
+                    curr = curr.find(part)
+            if curr is not None and curr != var_elem:
+                return curr.attrib.get('name', '')
+        return ''
+
+    def resolve_io_name(self, name):
+        import re
+        m = re.match(r'(GP_bool_out|GP_bool_in|GP_int_out|GP_int_in|GP_float_out|GP_float_in|digital_out|digital_in|analog_out|analog_in|tool_out|tool_in)\[(\d+)\]', name)
+        if m:
+            prefix = m.group(1)
+            idx = int(m.group(2))
+            tag = ""
+            if prefix == 'GP_bool_out': tag = 'GeneralPurposeBooleanRegisterOutputNames'
+            elif prefix == 'GP_bool_in': tag = 'GeneralPurposeBooleanRegisterInputNames'
+            elif prefix == 'GP_int_out': tag = 'GeneralPurposeIntRegisterOutputNames'
+            elif prefix == 'GP_int_in': tag = 'GeneralPurposeIntRegisterInputNames'
+            elif prefix == 'GP_float_out': tag = 'GeneralPurposeFloatRegisterOutputNames'
+            elif prefix == 'GP_float_in': tag = 'GeneralPurposeFloatRegisterInputNames'
+            elif prefix == 'digital_out': tag = 'DigitalOutputNames'
+            elif prefix == 'digital_in': tag = 'DigitalInputNames'
+            elif prefix == 'analog_out': tag = 'AnalogOutputNames'
+            elif prefix == 'analog_in': tag = 'AnalogInputNames'
+            elif prefix == 'tool_out': tag = 'ToolDigitalOutputNames'
+            elif prefix == 'tool_in': tag = 'ToolDigitalInputNames'
+            
+            if tag and hasattr(self, 'io_manager') and self.io_manager:
+                names = self.io_manager.get_io_names(tag)
+                if idx < len(names) and names[idx].strip():
+                    return names[idx].strip()
+        return name
+
+    def build_tree(self, xml_elem, parent_item):
+        if not hasattr(self, 'xml_parent_map') or self.xml_parent_map.get('root') != self.urp_manager.root:
+            self.xml_parent_map = {c: p for p in self.urp_manager.root.iter() for c in p}
+            self.xml_parent_map['root'] = self.urp_manager.root
+            
+        program_nodes = {
+            'Folder', 'Waypoint', 'Comment', 'Assignment', 'Timer', 'Move', 'Wait', 'Set', 
+            'Popup', 'Halt', 'Loop', 'SubProg', 'Script', 'Force', 'Pallet', 'Seek', 'Suppress', 
+            'MainProgram', 'RobotProgram', 'URProgram', 'If', 'ElseIf', 'Else', 'SafeHome',
+            'InitVariablesNode', 'SpecialSequence', 'gui.program.direction.MoveDirectionNode',
+            'SetPayload', 'SuppressedNode', 'suppressedNode', 'ExpressionWaypoint'
+        }
+        
+        tag = xml_elem.tag
+        if tag not in program_nodes:
+            for child in xml_elem:
+                self.build_tree(child, parent_item)
+            return
+
+        is_hidden = xml_elem.attrib.get('keepHidden') == 'true'
+        is_suppressed = tag in ('suppressedNode', 'SuppressedNode')
+        
+        if is_suppressed:
+            is_hidden = True
+            tag = xml_elem.attrib.get('class', tag)
+
+        name = ""
+        if tag == 'Folder':
+            name = xml_elem.attrib.get('name', tag)
+        elif tag == 'Waypoint':
+            name = xml_elem.attrib.get('name', tag)
+            wp_type = xml_elem.attrib.get('type', '')
+            if wp_type == 'Variable':
+                var_elem = xml_elem.find('variable')
+                vname = self.resolve_variable_name(var_elem) if var_elem is not None else ""
+                name = f"{name} (変数位置: {vname})" if vname else f"{name} (変数位置)"
+            elif wp_type == 'Fixed':
+                name = f"{name} (固定位置)"
+            elif wp_type == 'Relative':
+                name = f"{name} (相対位置)"
+            elif wp_type:
+                name = f"{name} ({wp_type})"
+        elif tag == 'Comment':
+            comment = xml_elem.attrib.get('comment', '')
+            name = f"'{comment}'" if comment else "'コメント'"
+        elif tag == 'Move':
+            name = xml_elem.attrib.get('motionType', 'Move')
+        elif tag == 'Assignment':
+            var_elem = xml_elem.find('variable')
+            vname = self.resolve_variable_name(var_elem)
+            expr = self.parse_expression(xml_elem.find('expression'))
+            name = f"{vname}:={expr}" if vname else f"代入:={expr}"
+        elif tag == 'Timer':
+            var_elem = xml_elem.find('variable')
+            vname = self.resolve_variable_name(var_elem)
+            name = f"{vname}:" if vname else "タイマー:"
+        elif tag == 'Set':
+            pin = xml_elem.find('pin')
+            if pin is not None:
+                pname = pin.attrib.get('referencedName', '')
+                pname = self.resolve_io_name(pname)
+                name = f"設定 {pname}"
+            else:
+                name = "設定"
+        elif tag == 'Wait':
+            # Wait もIO待ちの場合がある
+            pin = xml_elem.find('pin')
+            if pin is not None:
+                pname = pin.attrib.get('referencedName', '')
+                pname = self.resolve_io_name(pname)
+                name = f"待機 {pname}=HI" # 簡易表示
+            else:
+                expr = self.parse_expression(xml_elem.find('expression'))
+                name = f"待機 {expr}" if expr else "待機"
+        elif tag == 'If':
+            expr = self.parse_expression(xml_elem.find('expression'))
+            name = f"If文  {expr}"
+        elif tag == 'ElseIf':
+            expr = self.parse_expression(xml_elem.find('expression'))
+            name = f"ElseIf  {expr}"
+        elif tag == 'Else':
+            name = "Else"
+        elif tag == 'SpecialSequence':
+            name = "開始前シーケンス"
+        elif tag == 'InitVariablesNode':
+            name = "変数設定"
+        elif tag == 'MainProgram':
+            name = "ロボットプログラム"
+        elif tag == 'URProgram':
+            name = "プログラム"
+        elif tag == 'Script':
+            file_elem = xml_elem.find('file')
+            if file_elem is not None:
+                name = f"スクリプト: {file_elem.attrib.get('name', '')}"
+            else:
+                name = "スクリプト"
+        elif tag == 'Popup':
+            name = "ポップアップ"
+        else:
+            tag_ja_map = {
+                'SafeHome': 'ホーム (安全)',
+                'SetPayload': '荷重の設定',
+                'Loop': 'ループ',
+                'SubProg': 'サブプログラム',
+                'Force': 'フォース',
+                'Pallet': 'パレット',
+                'Seek': 'シーク',
+                'Suppress': '抑制',
+                'Halt': '停止'
+            }
+            name = tag_ja_map.get(tag, tag)
+                
+        if is_suppressed:
+            name = f"'{name}' (非表示)"
+        elif is_hidden:
+            name = f"{name} (非表示)"
+                
+        item = QTreeWidgetItem(parent_item, [name])
+        item.setData(0, Qt.ItemDataRole.UserRole, id(xml_elem))
+        self.tree_item_map[id(xml_elem)] = item
+        
+        for child in xml_elem:
+            self.build_tree(child, item)
+
+    def on_tree_item_clicked(self, item, column):
+        elem_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if elem_id in self.urp_elements_map:
+            tab_index, row, tag_name = self.urp_elements_map[elem_id]
+            self.tabs.setCurrentIndex(tab_index)
+            table = self.urp_tables[tag_name]
+            table.selectRow(row)
+
+    def on_urp_item_changed(self, item, tag_name):
+        if item.column() == 1:
+            row = item.row()
+            new_name = item.text()
+            
+            # 対応する elem を探す
+            target_elem_id = None
+            for elem_id, (t_idx, r, t_name) in self.urp_elements_map.items():
+                if t_name == tag_name and r == row:
+                    target_elem_id = elem_id
+                    break
+                    
+            if target_elem_id:
+                # 実際のXML要素を更新
+                nodes = self.urp_manager.get_editable_nodes(tag_name)
+                # nodesはリストなので、idが一致するものを探す（通常は同じ順番）
+                for node in nodes:
+                    if id(node) == target_elem_id:
+                        self.urp_manager.set_node_name(node, new_name)
+                        break
+                        
+                # ツリー側の表示も更新
+                if target_elem_id in self.tree_item_map:
+                    tree_item = self.tree_item_map[target_elem_id]
+                    display_name = f"{tag_name} ({new_name})" if new_name else tag_name
+                    tree_item.setText(0, display_name)
+
+
+    # --- IO 関連処理 ---
+    def populate_io_tables(self):
+        for tag_name, table in self.io_tables.items():
+            table.blockSignals(True)
             names = self.io_manager.get_io_names(tag_name)
             table.setRowCount(len(names))
             
-            is_gp = self.tag_is_gp[tag_name]
+            is_gp = self.io_tag_is_gp[tag_name]
             
-            # Type名を探す
             display_type = ""
-            for _, tags in self.tab_configs:
+            for _, tags in self.io_tab_configs:
                 for t_name, d_type, _ in tags:
                     if t_name == tag_name:
                         display_type = d_type
                         break
             
             for row, name in enumerate(names):
-                # Index
                 item_idx = QTableWidgetItem(str(row))
                 item_idx.setFlags(item_idx.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 table.setItem(row, 0, item_idx)
                 
-                # Type
                 item_type = QTableWidgetItem(display_type)
                 item_type.setFlags(item_type.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 table.setItem(row, 1, item_type)
                 
                 if is_gp:
-                    # Addr (空)
                     table.setItem(row, 2, QTableWidgetItem(""))
-                    # IO Name
                     table.setItem(row, 3, QTableWidgetItem(name))
                 else:
                     table.setItem(row, 2, QTableWidgetItem(name))
             
             table.blockSignals(False)
 
-    def on_item_changed(self, item, table):
-        # GPタブでのみ発火し、Addr列（2列目）が変更された場合のみ処理
+    def on_io_item_changed(self, item, table):
         if item.column() == 2:
             row = item.row()
             val = item.text()
             if not val:
                 return
             
-            # 正規表現でプレフィックスと16進数部分を分離
-            # 例: "EX000F" -> prefix="EX", hex_str="000F"
             match = re.match(r'^(.*?)([0-9A-Fa-f]+)$', val)
             if match:
                 prefix = match.group(1)
@@ -213,9 +606,7 @@ class IOEditorWindow(QMainWindow):
                 except ValueError:
                     return
                 
-                # イベント再帰を防ぐ
                 table.blockSignals(True)
-                
                 for r in range(table.rowCount()):
                     if r == row:
                         continue
@@ -225,53 +616,66 @@ class IOEditorWindow(QMainWindow):
                         table.setItem(r, 2, QTableWidgetItem(""))
                         continue
                     
-                    # フォーマット（ゼロ埋め、大文字小文字維持）
                     new_hex = hex(new_val)[2:]
                     if is_upper:
                         new_hex = new_hex.upper()
                     new_hex = new_hex.zfill(hex_len)
-                    
                     table.setItem(r, 2, QTableWidgetItem(prefix + new_hex))
-                
                 table.blockSignals(False)
 
-    def collect_data_and_save(self, filepath):
+    # --- 保存処理 ---
+    def save_files(self):
         try:
-            for tag_name, table in self.tables.items():
-                names = []
-                is_gp = self.tag_is_gp[tag_name]
-                name_col = 3 if is_gp else 2
+            # IOs 保存
+            if self.current_installation_file:
+                for tag_name, table in self.io_tables.items():
+                    names = []
+                    is_gp = self.io_tag_is_gp[tag_name]
+                    name_col = 3 if is_gp else 2
+                    for row in range(table.rowCount()):
+                        item = table.item(row, name_col)
+                        names.append(item.text() if item else "")
+                    self.io_manager.set_io_names(tag_name, names)
+                self.io_manager.save(self.current_installation_file)
                 
-                for row in range(table.rowCount()):
-                    item = table.item(row, name_col)
-                    name = item.text() if item else ""
-                    # "空欄だったものはそのまま空欄" は空文字として取得し、
-                    # IOManager側でフォーマット維持するように処理済み
-                    names.append(name)
+            # URP 保存 (変更は既にurp_managerの要素に反映されているのでそのままsave)
+            if self.current_urp_file:
+                self.urp_manager.save(self.current_urp_file)
                 
-                self.io_manager.set_io_names(tag_name, names)
-                
-            self.io_manager.save(filepath)
-            self.current_file = filepath
-            self.setWindowTitle(f"UR .installation IO Editor - {os.path.basename(filepath)}")
             QMessageBox.information(self, "成功", "ファイルを保存しました。")
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"保存エラー:\n{str(e)}")
 
-    def save_file(self):
-        if self.current_file:
-            self.collect_data_and_save(self.current_file)
-
-    def save_as_file(self):
-        if not self.io_manager.tree:
-            return
-        filepath, _ = QFileDialog.getSaveFileName(self, "名前を付けて保存", "", "Installation Files (*.installation);;All Files (*)")
-        if filepath:
-            self.collect_data_and_save(filepath)
+    def save_as_files(self):
+        # 1つのファイルだけ開いているか、両方かによって処理を変えるか、単にフォルダ選択にするか
+        # ユーザーに保存先フォルダを選ばせるのが無難
+        dirpath = QFileDialog.getExistingDirectory(self, "保存先フォルダを選択")
+        if dirpath:
+            try:
+                if self.current_installation_file:
+                    new_inst = os.path.join(dirpath, os.path.basename(self.current_installation_file))
+                    for tag_name, table in self.io_tables.items():
+                        names = []
+                        is_gp = self.io_tag_is_gp[tag_name]
+                        name_col = 3 if is_gp else 2
+                        for row in range(table.rowCount()):
+                            item = table.item(row, name_col)
+                            names.append(item.text() if item else "")
+                        self.io_manager.set_io_names(tag_name, names)
+                    self.io_manager.save(new_inst)
+                    self.current_installation_file = new_inst
+                    
+                if self.current_urp_file:
+                    new_urp = os.path.join(dirpath, os.path.basename(self.current_urp_file))
+                    self.urp_manager.save(new_urp)
+                    self.current_urp_file = new_urp
+                    
+                QMessageBox.information(self, "成功", "名前を付けて保存しました。")
+            except Exception as e:
+                QMessageBox.critical(self, "エラー", f"保存エラー:\n{str(e)}")
 
 def main():
     app = QApplication(sys.argv)
-    # モダンUIにあわせてWindows標準スタイルを適用
     app.setStyle("windowsvista")
     window = IOEditorWindow()
     window.show()

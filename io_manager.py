@@ -3,6 +3,9 @@ import xml.etree.ElementTree as ET
 
 class IOManager:
     def __init__(self):
+        self.clear()
+        
+    def clear(self):
         self.tree = None
         self.root = None
         self.ios = None
@@ -20,6 +23,8 @@ class IOManager:
             
     def get_io_names(self, tag_name):
         """指定したタグの value 属性からカンマ区切りのリストを取得する"""
+        if self.ios is None:
+            return []
         elem = self.ios.find(tag_name)
         if elem is not None:
             val = elem.attrib.get('value', '')
