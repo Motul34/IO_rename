@@ -1,5 +1,8 @@
 import gzip
+import logging
 import xml.etree.ElementTree as ET
+
+logger = logging.getLogger(__name__)
 
 class IOManager:
     def __init__(self):
@@ -10,16 +13,25 @@ class IOManager:
         self.root = None
         self.ios = None
         self.file_path = None
+        self._xml_declaration = '<?xml version="1.0" encoding="utf-8"?>\n'
         
     def load(self, filepath):
         self.file_path = filepath
+        logger.info("installation ファイルを読み込み中: %s", filepath)
         with gzip.open(filepath, 'rt', encoding='utf-8') as f:
             content = f.read()
+        
+        # XML宣言を保存しておく
+        if content.startswith('<?xml'):
+            decl_end = content.index('?>') + 2
+            self._xml_declaration = content[:decl_end] + '\n'
+        
         self.tree = ET.ElementTree(ET.fromstring(content))
         self.root = self.tree.getroot()
         self.ios = self.root.find('IOs')
         if self.ios is None:
             raise ValueError("ファイル内に <IOs> タグが見つかりません。")
+        logger.info("installation ファイル読み込み完了")
             
     def get_io_names(self, tag_name):
         """指定したタグの value 属性からカンマ区切りのリストを取得する"""
@@ -45,7 +57,9 @@ class IOManager:
     def save(self, filepath=None):
         if filepath is None:
             filepath = self.file_path
-        # 元のXMLに合わせて出力
-        xml_str = ET.tostring(self.root, encoding='utf-8').decode('utf-8')
+        logger.info("installation ファイルを保存中: %s", filepath)
+        # XML宣言を付与して元のフォーマットを維持する
+        xml_str = self._xml_declaration + ET.tostring(self.root, encoding='unicode')
         with gzip.open(filepath, 'wt', encoding='utf-8') as f:
             f.write(xml_str)
+        logger.info("installation ファイル保存完了")
