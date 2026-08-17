@@ -19,7 +19,8 @@ PROGRAM_NODES = {
     'Popup', 'Halt', 'Loop', 'SubProg', 'Script', 'Force', 'Pallet', 'Seek', 'Suppress',
     'MainProgram', 'RobotProgram', 'URProgram', 'If', 'ElseIf', 'Else', 'SafeHome',
     'InitVariablesNode', 'SpecialSequence', 'gui.program.direction.MoveDirectionNode',
-    'SetPayload', 'SuppressedNode', 'suppressedNode', 'ExpressionWaypoint', 'Until'
+    'SetPayload', 'SuppressedNode', 'suppressedNode', 'ExpressionWaypoint', 'Until',
+    'Thread', 'CallSubProgram', 'SubProgram'
 }
 
 # 方向ノードの日本語マッピング
@@ -75,7 +76,12 @@ def _display_waypoint(elem, parent_map, io_manager):
 
 def _display_comment(elem, parent_map, io_manager):
     comment = elem.attrib.get('comment', '')
-    return f"'{comment}'" if comment else "'コメント'"
+    return f"コメント: {comment}" if comment else "コメント"
+
+
+def _display_popup(elem, parent_map, io_manager):
+    message = elem.attrib.get('message', '')
+    return f"ポップアップ: {message}" if message else "ポップアップ"
 
 
 def _display_move(elem, parent_map, io_manager):
@@ -160,6 +166,55 @@ def _display_script(elem, parent_map, io_manager):
     return "スクリプト"
 
 
+def _display_thread(elem, parent_map, io_manager):
+    return elem.attrib.get('name', 'スレッド')
+
+
+def _display_call_subprogram(elem, parent_map, io_manager):
+    sub = elem.find('subprogram')
+    if sub is not None:
+        name = sub.attrib.get('name', '')
+        return f"呼び出し {name}" if name else "呼び出し"
+    return "呼び出し"
+
+
+def resolve_subprogram_reference(elem, parent_map):
+    ref = elem.attrib.get('reference', '')
+    if not ref:
+        return None
+    
+    parts = ref.split('/')
+    curr = elem
+    for part in parts:
+        if part == '..':
+            curr = parent_map.get(curr, curr)
+        elif '[' in part:
+            tag, idx_str = part.split('[')
+            idx = int(idx_str[:-1]) - 1
+            children = [c for c in curr if c.tag == tag]
+            if 0 <= idx < len(children):
+                curr = children[idx]
+            else:
+                return None
+        else:
+            found = False
+            for c in curr:
+                if c.tag == part:
+                    curr = c
+                    found = True
+                    break
+            if not found:
+                return None
+    return curr
+
+
+def _display_subprogram(elem, parent_map, io_manager):
+    curr = resolve_subprogram_reference(elem, parent_map)
+    if curr is not None:
+        return curr.attrib.get('name', 'サブプログラム')
+    return "サブプログラム (参照エラー)"
+
+
 # ディスパッチテーブル: tag → 表示名生成関数
 NODE_DISPLAY_HANDLERS = {
     'Folder': _display_folder,
@@ -180,7 +235,10 @@ NODE_DISPLAY_HANDLERS = {
     'MainProgram': lambda e, pm, io: "ロボットプログラム",
     'URProgram': lambda e, pm, io: "プログラム",
     'Script': _display_script,
-    'Popup': lambda e, pm, io: "ポップアップ",
+    'Popup': _display_popup,
+    'Thread': _display_thread,
+    'CallSubProgram': _display_call_subprogram,
+    'SubProgram': _display_subprogram,
 }
 
 
@@ -243,6 +301,16 @@ def build_tree(xml_elem, parent_item, parent_map, io_manager,
     item.setData(0, Qt.ItemDataRole.UserRole, id(xml_elem))
     tree_item_map[id(xml_elem)] = item
     
-    for child in xml_elem:
+    children_to_iterate = xml_elem
+    if tag == 'CallSubProgram':
+        children_to_iterate = []
+    elif tag == 'SubProgram':
+        curr = resolve_subprogram_reference(xml_elem, parent_map)
+        if curr is not None:
+            children_node = curr.find('children')
+            if children_node is not None:
+                children_to_iterate = children_node
+
+    for child in children_to_iterate:
         build_tree(child, item, parent_map, io_manager,
                    show_suppressed, tree_item_map)
